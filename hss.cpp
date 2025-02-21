@@ -5,170 +5,243 @@
 #include <pthread.h>
 #include <cmath>
 #include <string>
+#include <set>
+#include <numeric>
 
+// Global configuration structure for shared settings and synchronization
 struct Config {
-    int num_threads;
-    int seed;
-    size_t array_size;
-    bool verbose;
-    std::vector<int> data;
-    std::vector<int> splitters;
-    pthread_barrier_t barrier;
-    pthread_mutex_t mutex;
-    double epsilon;
-    int round = 0;
-};
-Config config;
-
-struct ThreadData {
-    int tid;
-    std::vector<int> local_data;
-    std::vector<int> samples;
-};
-
-void generate_data(size_t size, int seed) {
-    std::mt19937 rng(seed);
-    std::uniform_int_distribution<int> dist(1, 1000);
-    config.data.resize(size);
-    for (auto& val : config.data) val = dist(rng);
-}
-
-void print_array(const std::string& label, const std::vector<int>& arr) {
-    std::cout << label << ": [";
-    for (size_t i = 0; i < std::min(arr.size(), 10UL); ++i) {
-        std::cout << arr[i];
-        if (i < arr.size() - 1) std::cout << ", ";
-    }
-    if (arr.size() > 10) std::cout << "... ] (" << arr.size() << " elements)\n";
-    else std::cout << "]\n";
-}
-
-void* hss_thread(void* arg) {
-    ThreadData* tdata = static_cast<ThreadData*>(arg);
-    int tid = tdata->tid;
-    size_t n = config.array_size;
-    int p = config.num_threads;
-    double eps = config.epsilon;
-
-    size_t chunk_size = n / p;
-    size_t start = tid * chunk_size;
-    size_t end = (tid == p-1) ? n : start + chunk_size;
-    tdata->local_data.assign(config.data.begin() + start, config.data.begin() + end);
-    std::sort(tdata->local_data.begin(), tdata->local_data.end());
-
-    pthread_barrier_wait(&config.barrier);
-
-    // ─── Epsilon Usage Added Here ───
-    int target_max = (1 + eps) * (n / p);
-    std::vector<int> splitter_intervals(p-1, 0);
+    int num_workers;                    // Number of parallel workers (threads)
+    int random_seed;                    // Seed for reproducible randomization
+    size_t total_elements;              // Total number of elements to sort
+    bool verbose_output;                // Enable detailed debug prints
+    std::vector<long long> dataset;     // Original unsorted dataset (using long long for large values)
+    std::vector<long long> splitters;   // Selected partition boundaries
+    pthread_barrier_t barrier;          // Synchronization barrier for threads
+    pthread_mutex_t lock;               // Mutex for shared data protection
+    double max_imbalance;               // Allowed load imbalance ratio (ε), not used yet
     
-    for (int iter = 0; iter < std::log2(p); ++iter) {
-        int sample_size = std::log2(p) * (iter + 1);
-        tdata->samples.clear();
-        std::sample(tdata->local_data.begin(), tdata->local_data.end(),
-                    std::back_inserter(tdata->samples), sample_size,
+    // For data exchange between workers
+    std::vector<std::vector<long long>> bucket_contributions; // [bucket_id][elements]
+    std::vector<pthread_mutex_t> bucket_locks;               // One mutex per bucket
+};
+Config global_config;
+
+// Per-thread execution state
+struct WorkerContext {
+    int worker_id;                      // Unique worker ID (0 to num_workers-1)
+    std::vector<long long> local_chunk; // Subset of data assigned to this worker
+    std::vector<long long> local_samples; // Locally sampled pivot candidates
+};
+
+// Print debug messages if verbose mode is enabled or forced
+void debug_print(const std::string& message, bool force = false) {
+    if (global_config.verbose_output || force) {
+        std::cerr << "[DEBUG] " << message << "\n";
+    }
+}
+
+// Print vector contents (limited to first 10 elements for brevity)
+void print_vector(const std::string& label, const std::vector<long long>& vec, bool force_verbose = false) {
+    if (!global_config.verbose_output && !force_verbose) return;
+    std::cerr << "[DEBUG] " << label << " (" << vec.size() << " elements): [";
+    for (size_t i = 0; i < std::min(vec.size(), 10UL); ++i) {
+        std::cerr << vec[i] << (i < vec.size()-1 ? ", " : "");
+    }
+    if (vec.size() > 10) std::cerr << "...";
+    std::cerr << "]\n";
+}
+
+// Worker thread function implementing the HSS algorithm
+void* worker_function(void* arg) {
+    WorkerContext* ctx = static_cast<WorkerContext*>(arg);
+    const int worker_id = ctx->worker_id;
+    const size_t dataset_size = global_config.total_elements;
+    const int total_workers = global_config.num_workers;
+
+    // Phase 1: Initial Data Partitioning
+    // Divide dataset into contiguous chunks for each worker
+    const size_t base_chunk_size = dataset_size / total_workers;
+    const size_t chunk_start = worker_id * base_chunk_size;
+    const size_t chunk_end = (worker_id == total_workers - 1) 
+                           ? dataset_size 
+                           : chunk_start + base_chunk_size;
+    
+    // Assign and sort local chunk
+    ctx->local_chunk.assign(global_config.dataset.begin() + chunk_start,
+                           global_config.dataset.begin() + chunk_end);
+    std::sort(ctx->local_chunk.begin(), ctx->local_chunk.end());
+
+    debug_print("Worker " + std::to_string(worker_id) + 
+                " initial chunk size: " + std::to_string(ctx->local_chunk.size()));
+    print_vector("Worker " + std::to_string(worker_id) + " initial chunk", ctx->local_chunk);
+
+    pthread_barrier_wait(&global_config.barrier);
+
+    // Phase 2: Splitter Selection
+    // Sample elements from local chunk for global splitter selection
+    const int samples_per_worker = 10 * total_workers; // Increased sample size for better distribution capture
+    ctx->local_samples.clear();
+    if (ctx->local_chunk.size() >= (size_t)samples_per_worker) {
+        std::sample(ctx->local_chunk.begin(), ctx->local_chunk.end(),
+                    std::back_inserter(ctx->local_samples), samples_per_worker,
                     std::mt19937{std::random_device{}()});
-
-        pthread_mutex_lock(&config.mutex);
-        for (int s : tdata->samples) config.splitters.push_back(s);
-        pthread_mutex_unlock(&config.mutex);
-
-        pthread_barrier_wait(&config.barrier);
-
-        if (tid == 0 && iter == 0) {
-            std::sort(config.splitters.begin(), config.splitters.end());
-            for (int i = 0; i < p-1; ++i) {
-                splitter_intervals[i] = config.splitters[(i+1) * (config.splitters.size() / p)];
-            }
-        }
-
-        pthread_barrier_wait(&config.barrier);
-
-        // ─── Epsilon Used in Histogram Adjustment ───
-        std::vector<int> local_hist(p, 0);
-        for (int val : tdata->local_data) {
-            auto it = std::upper_bound(splitter_intervals.begin(), splitter_intervals.end(), val);
-            int bin = std::distance(splitter_intervals.begin(), it);
-            if (local_hist[bin] < target_max) {
-                local_hist[bin]++;
-            }
-        }
-
-        pthread_mutex_lock(&config.mutex);
-        for (int i = 0; i < p; ++i) config.splitters[i] += local_hist[i];
-        pthread_mutex_unlock(&config.mutex);
-
-        pthread_barrier_wait(&config.barrier);
+    } else {
+        ctx->local_samples = ctx->local_chunk;
     }
 
-    std::vector<int> partitioned;
-    for (int val : tdata->local_data) {
-        auto it = std::upper_bound(config.splitters.begin(), config.splitters.end(), val);
-        if (std::distance(config.splitters.begin(), it) == tid) {
-            partitioned.push_back(val);
+    // Contribute samples to global splitters (thread-safe)
+    pthread_mutex_lock(&global_config.lock);
+    global_config.splitters.insert(global_config.splitters.end(),
+                                   ctx->local_samples.begin(), ctx->local_samples.end());
+    pthread_mutex_unlock(&global_config.lock);
+    
+    pthread_barrier_wait(&global_config.barrier);
+
+    // Leader worker (ID 0) selects splitters from collected samples
+    if (worker_id == 0) {
+        std::sort(global_config.splitters.begin(), global_config.splitters.end());
+        const size_t total_samples = global_config.splitters.size();
+        const size_t splitter_step = total_samples / total_workers;
+        
+        global_config.splitters.clear();
+        for (int i = 1; i < total_workers; ++i) {
+            size_t idx = i * splitter_step;
+            if (idx < total_samples) {
+                global_config.splitters.push_back(global_config.splitters[idx]);
+            }
+        }
+        // Ensure exactly (num_workers - 1) splitters
+        while (global_config.splitters.size() < (size_t)total_workers - 1) {
+            global_config.splitters.push_back(global_config.splitters.back());
+        }
+        print_vector("Selected splitters", global_config.splitters, true);
+    }
+    pthread_barrier_wait(&global_config.barrier);
+
+    // Phase 3: Partition and Exchange Data
+    // Partition local chunk into buckets based on splitters
+    std::vector<std::vector<long long>> local_buckets(total_workers);
+    for (long long value : ctx->local_chunk) {
+        auto split_pos = std::upper_bound(global_config.splitters.begin(),
+                                          global_config.splitters.end(), value);
+        int bucket_idx = std::distance(global_config.splitters.begin(), split_pos);
+        bucket_idx = std::clamp(bucket_idx, 0, total_workers - 1);
+        local_buckets[bucket_idx].push_back(value);
+    }
+
+    // Contribute to global buckets (thread-safe)
+    for (int i = 0; i < total_workers; ++i) {
+        if (!local_buckets[i].empty()) {
+            pthread_mutex_lock(&global_config.bucket_locks[i]);
+            global_config.bucket_contributions[i].insert(
+                global_config.bucket_contributions[i].end(),
+                local_buckets[i].begin(), local_buckets[i].end());
+            pthread_mutex_unlock(&global_config.bucket_locks[i]);
         }
     }
-    std::sort(partitioned.begin(), partitioned.end());
-    tdata->local_data = partitioned;
+
+    pthread_barrier_wait(&global_config.barrier);
+
+    // Each worker takes its assigned bucket and sorts it
+    ctx->local_chunk = global_config.bucket_contributions[worker_id];
+    std::sort(ctx->local_chunk.begin(), ctx->local_chunk.end());
+
+    debug_print("Worker " + std::to_string(worker_id) + 
+                " final chunk size: " + std::to_string(ctx->local_chunk.size()));
+    print_vector("Worker " + std::to_string(worker_id) + " final chunk", ctx->local_chunk);
+
     return nullptr;
 }
 
+// Main execution flow
 int main(int argc, char* argv[]) {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0] 
-                  << " <seed> <num_threads> <epsilon> <array_size> [--verbose]\n";
+                  << " <seed> <workers> <imbalance> <size> [--verbose]\n";
         return 1;
     }
 
-    config.seed = std::stoi(argv[1]);
-    config.num_threads = std::stoi(argv[2]);
-    config.epsilon = std::stod(argv[3]);
-    config.array_size = std::stoul(argv[4]);
-    config.verbose = (argc >= 6 && std::string(argv[5]) == "--verbose");
+    // Parse command-line arguments
+    global_config.random_seed = std::stoi(argv[1]);
+    global_config.num_workers = std::stoi(argv[2]);
+    global_config.max_imbalance = std::stod(argv[3]);
+    global_config.total_elements = std::stoul(argv[4]);
+    global_config.verbose_output = (argc >= 6 && std::string(argv[5]) == "--verbose");
 
-    generate_data(config.array_size, config.seed);
-    
-    if (config.verbose) {
-        print_array("Initial Array", config.data);
+    // Generate skewed dataset without duplicates
+    std::vector<long long> unique_sequence(global_config.total_elements);
+    for (size_t i = 0; i < global_config.total_elements; ++i) {
+        unique_sequence[i] = i + 1; // 1 to N
+    }
+    // Apply skew: square each element to create a skewed distribution
+    global_config.dataset.resize(global_config.total_elements);
+    for (size_t i = 0; i < global_config.total_elements; ++i) {
+        global_config.dataset[i] = unique_sequence[i] * unique_sequence[i];
+    }
+    // Shuffle the dataset to simulate random order
+    std::mt19937 rng(global_config.random_seed);
+    std::shuffle(global_config.dataset.begin(), global_config.dataset.end(), rng);
+
+    if (global_config.total_elements <= 100) {
+        print_vector("Full dataset before sorting", global_config.dataset, true);
     }
 
-    pthread_barrier_init(&config.barrier, nullptr, config.num_threads);
-    pthread_mutex_init(&config.mutex, nullptr);
-
-    std::vector<pthread_t> threads(config.num_threads);
-    std::vector<ThreadData> tdata(config.num_threads);
-    for (int i = 0; i < config.num_threads; ++i) {
-        tdata[i].tid = i;
-        pthread_create(&threads[i], nullptr, hss_thread, &tdata[i]);
+    // Initialize synchronization primitives
+    pthread_barrier_init(&global_config.barrier, nullptr, global_config.num_workers);
+    pthread_mutex_init(&global_config.lock, nullptr);
+    global_config.bucket_contributions.resize(global_config.num_workers);
+    global_config.bucket_locks.resize(global_config.num_workers);
+    for (auto& lock : global_config.bucket_locks) {
+        pthread_mutex_init(&lock, nullptr);
     }
 
-    for (auto& t : threads) pthread_join(t, nullptr);
-
-    std::vector<int> sorted;
-    size_t total_elements = 0;
-    for (auto& td : tdata) {
-        sorted.insert(sorted.end(), td.local_data.begin(), td.local_data.end());
-        total_elements += td.local_data.size();
+    // Create worker threads
+    std::vector<pthread_t> threads(global_config.num_workers);
+    std::vector<WorkerContext> contexts(global_config.num_workers);
+    for (int i = 0; i < global_config.num_workers; ++i) {
+        contexts[i].worker_id = i;
+        pthread_create(&threads[i], nullptr, worker_function, &contexts[i]);
     }
 
-    // Add validation for element count
-    if (total_elements != config.array_size) {
-        std::cerr << "Error: " << (config.array_size - total_elements) 
-                << " elements were lost during partitioning!\n";
+    // Wait for all threads to complete
+    for (auto& thread : threads) pthread_join(thread, nullptr);
+
+    // Collect and validate results
+    std::vector<long long> sorted_result;
+    size_t total_counted = 0;
+    for (const auto& ctx : contexts) {
+        sorted_result.insert(sorted_result.end(),
+                             ctx.local_chunk.begin(), ctx.local_chunk.end());
+        total_counted += ctx.local_chunk.size();
+        debug_print("Worker " + std::to_string(ctx.worker_id) + 
+                    " contributed " + std::to_string(ctx.local_chunk.size()) + 
+                    " elements");
+    }
+
+    if (total_counted != global_config.total_elements) {
+        std::cerr << "CRITICAL: Lost " 
+                  << (global_config.total_elements - total_counted)
+                  << " elements!\n";
         return 1;
     }
 
-    if (config.verbose) {
-        print_array("Sorted Array", sorted);
+    // Validate sorting
+    std::sort(sorted_result.begin(), sorted_result.end());
+    std::vector<long long> sorted_original = global_config.dataset;
+    std::sort(sorted_original.begin(), sorted_original.end());
+    const bool is_valid = (sorted_result == sorted_original);
+    std::cout << "Validation: " 
+              << (is_valid ? "Sorted correctly!" : "Sorting failed!") 
+              << "\n";
+    if (global_config.verbose_output) {
+        print_vector("Final sorted output", sorted_result, true);
     }
 
-    if (std::is_sorted(sorted.begin(), sorted.end())) {
-        std::cout << "Sorting validated!\n";
-    } else {
-        std::cerr << "Sorting failed!\n";
+    // Cleanup synchronization primitives
+    pthread_barrier_destroy(&global_config.barrier);
+    pthread_mutex_destroy(&global_config.lock);
+    for (auto& lock : global_config.bucket_locks) {
+        pthread_mutex_destroy(&lock);
     }
-
-    pthread_barrier_destroy(&config.barrier);
-    pthread_mutex_destroy(&config.mutex);
     return 0;
 }
