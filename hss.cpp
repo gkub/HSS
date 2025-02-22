@@ -7,6 +7,11 @@
 #include <string>
 #include <set>
 #include <numeric>
+#include <chrono> // Added for timing
+
+// Using directives for cleaner timing code
+using Clock = std::chrono::high_resolution_clock;
+using Duration = std::chrono::duration<double>;
 
 // Global configuration structure for shared settings and synchronization
 struct Config {
@@ -31,6 +36,12 @@ struct WorkerContext {
     int worker_id;                      // Unique worker ID (0 to num_workers-1)
     std::vector<long long> local_chunk; // Subset of data assigned to this worker
     std::vector<long long> local_samples; // Locally sampled pivot candidates
+    // Timing variables (in seconds) for each phase
+    double phase1_duration;             // Initial partitioning and local sorting
+    double phase2a_duration;            // Sample selection and contribution
+    double phase2b_duration;            // Splitter selection (leader only)
+    double phase3_duration;             // Partitioning and data exchange
+    double phase4_duration;             // Final bucket sorting
 };
 
 // Print debug messages if verbose mode is enabled or forced
@@ -51,40 +62,42 @@ void print_vector(const std::string& label, const std::vector<long long>& vec, b
     std::cerr << "]\n";
 }
 
-// Worker thread function implementing the HSS algorithm
+// Worker thread function implementing the HSS algorithm with timing
 void* worker_function(void* arg) {
     WorkerContext* ctx = static_cast<WorkerContext*>(arg);
     const int worker_id = ctx->worker_id;
     const size_t dataset_size = global_config.total_elements;
     const int total_workers = global_config.num_workers;
 
-    // Phase 1: Initial Data Partitioning
-    // Divide dataset into contiguous chunks for each worker
+    // Phase 1: Initial Data Partitioning and Local Sorting
+    auto start_phase1 = Clock::now();
     const size_t base_chunk_size = dataset_size / total_workers;
     const size_t chunk_start = worker_id * base_chunk_size;
     const size_t chunk_end = (worker_id == total_workers - 1) 
                            ? dataset_size 
                            : chunk_start + base_chunk_size;
     
-    // Assign and sort local chunk
     ctx->local_chunk.assign(global_config.dataset.begin() + chunk_start,
                            global_config.dataset.begin() + chunk_end);
     std::sort(ctx->local_chunk.begin(), ctx->local_chunk.end());
+    auto end_phase1 = Clock::now();
+    ctx->phase1_duration = Duration(end_phase1 - start_phase1).count();
 
     debug_print("Worker " + std::to_string(worker_id) + 
                 " initial chunk size: " + std::to_string(ctx->local_chunk.size()));
     print_vector("Worker " + std::to_string(worker_id) + " initial chunk", ctx->local_chunk);
 
-    pthread_barrier_wait(&global_config.barrier);
+    pthread_barrier_wait(&global_config.barrier); // Barrier after Phase 1
 
-    // Phase 2: Splitter Selection
-    // Sample elements from local chunk for global splitter selection
-    const int samples_per_worker = 10 * total_workers; // Increased sample size for better distribution capture
+    // Phase 2a: Sample Selection and Contribution
+    auto start_phase2a = Clock::now();
+    const int samples_per_worker = 10 * total_workers; // Oversampling for better splitters
     ctx->local_samples.clear();
     if (ctx->local_chunk.size() >= (size_t)samples_per_worker) {
+        // Use a worker-specific seed for reproducibility
+        std::mt19937 rng(global_config.random_seed + worker_id);
         std::sample(ctx->local_chunk.begin(), ctx->local_chunk.end(),
-                    std::back_inserter(ctx->local_samples), samples_per_worker,
-                    std::mt19937{std::random_device{}()});
+                    std::back_inserter(ctx->local_samples), samples_per_worker, rng);
     } else {
         ctx->local_samples = ctx->local_chunk;
     }
@@ -94,10 +107,13 @@ void* worker_function(void* arg) {
     global_config.splitters.insert(global_config.splitters.end(),
                                    ctx->local_samples.begin(), ctx->local_samples.end());
     pthread_mutex_unlock(&global_config.lock);
+    auto end_phase2a = Clock::now();
+    ctx->phase2a_duration = Duration(end_phase2a - start_phase2a).count();
     
-    pthread_barrier_wait(&global_config.barrier);
+    pthread_barrier_wait(&global_config.barrier); // Barrier after sample contribution
 
-    // Leader worker (ID 0) selects splitters from collected samples
+    // Phase 2b: Splitter Selection by Leader
+    auto start_phase2b = Clock::now();
     if (worker_id == 0) {
         std::sort(global_config.splitters.begin(), global_config.splitters.end());
         const size_t total_samples = global_config.splitters.size();
@@ -110,16 +126,18 @@ void* worker_function(void* arg) {
                 global_config.splitters.push_back(global_config.splitters[idx]);
             }
         }
-        // Ensure exactly (num_workers - 1) splitters
         while (global_config.splitters.size() < (size_t)total_workers - 1) {
             global_config.splitters.push_back(global_config.splitters.back());
         }
         print_vector("Selected splitters", global_config.splitters, true);
     }
-    pthread_barrier_wait(&global_config.barrier);
+    auto end_phase2b = Clock::now();
+    ctx->phase2b_duration = (worker_id == 0) ? Duration(end_phase2b - start_phase2b).count() : 0.0;
+
+    pthread_barrier_wait(&global_config.barrier); // Barrier after splitter selection
 
     // Phase 3: Partition and Exchange Data
-    // Partition local chunk into buckets based on splitters
+    auto start_phase3 = Clock::now();
     std::vector<std::vector<long long>> local_buckets(total_workers);
     for (long long value : ctx->local_chunk) {
         auto split_pos = std::upper_bound(global_config.splitters.begin(),
@@ -139,12 +157,17 @@ void* worker_function(void* arg) {
             pthread_mutex_unlock(&global_config.bucket_locks[i]);
         }
     }
+    auto end_phase3 = Clock::now();
+    ctx->phase3_duration = Duration(end_phase3 - start_phase3).count();
 
-    pthread_barrier_wait(&global_config.barrier);
+    pthread_barrier_wait(&global_config.barrier); // Barrier after data exchange
 
-    // Each worker takes its assigned bucket and sorts it
+    // Phase 4: Final Sorting of Assigned Bucket
+    auto start_phase4 = Clock::now();
     ctx->local_chunk = global_config.bucket_contributions[worker_id];
     std::sort(ctx->local_chunk.begin(), ctx->local_chunk.end());
+    auto end_phase4 = Clock::now();
+    ctx->phase4_duration = Duration(end_phase4 - start_phase4).count();
 
     debug_print("Worker " + std::to_string(worker_id) + 
                 " final chunk size: " + std::to_string(ctx->local_chunk.size()));
@@ -153,7 +176,7 @@ void* worker_function(void* arg) {
     return nullptr;
 }
 
-// Main execution flow
+// Main execution flow with total timing
 int main(int argc, char* argv[]) {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0] 
@@ -173,12 +196,10 @@ int main(int argc, char* argv[]) {
     for (size_t i = 0; i < global_config.total_elements; ++i) {
         unique_sequence[i] = i + 1; // 1 to N
     }
-    // Apply skew: square each element to create a skewed distribution
     global_config.dataset.resize(global_config.total_elements);
     for (size_t i = 0; i < global_config.total_elements; ++i) {
         global_config.dataset[i] = unique_sequence[i] * unique_sequence[i];
     }
-    // Shuffle the dataset to simulate random order
     std::mt19937 rng(global_config.random_seed);
     std::shuffle(global_config.dataset.begin(), global_config.dataset.end(), rng);
 
@@ -195,16 +216,24 @@ int main(int argc, char* argv[]) {
         pthread_mutex_init(&lock, nullptr);
     }
 
-    // Create worker threads
+    // Create worker threads and start total timing
+    auto total_start = Clock::now();
     std::vector<pthread_t> threads(global_config.num_workers);
     std::vector<WorkerContext> contexts(global_config.num_workers);
     for (int i = 0; i < global_config.num_workers; ++i) {
         contexts[i].worker_id = i;
+        contexts[i].phase1_duration = 0.0;  // Initialize timing variables
+        contexts[i].phase2a_duration = 0.0;
+        contexts[i].phase2b_duration = 0.0;
+        contexts[i].phase3_duration = 0.0;
+        contexts[i].phase4_duration = 0.0;
         pthread_create(&threads[i], nullptr, worker_function, &contexts[i]);
     }
 
     // Wait for all threads to complete
     for (auto& thread : threads) pthread_join(thread, nullptr);
+    auto total_end = Clock::now();
+    double total_time = Duration(total_end - total_start).count();
 
     // Collect and validate results
     std::vector<long long> sorted_result;
@@ -236,6 +265,36 @@ int main(int argc, char* argv[]) {
     if (global_config.verbose_output) {
         print_vector("Final sorted output", sorted_result, true);
     }
+
+    // Compute and display timing results
+    double max_phase1 = 0.0;
+    double max_phase2a = 0.0;
+    double leader_phase2b = 0.0;
+    double max_phase3 = 0.0;
+    double max_phase4 = 0.0;
+
+    for (const auto& ctx : contexts) {
+        max_phase1 = std::max(max_phase1, ctx.phase1_duration);
+        max_phase2a = std::max(max_phase2a, ctx.phase2a_duration);
+        if (ctx.worker_id == 0) {
+            leader_phase2b = ctx.phase2b_duration;
+        }
+        max_phase3 = std::max(max_phase3, ctx.phase3_duration);
+        max_phase4 = std::max(max_phase4, ctx.phase4_duration);
+    }
+
+    double total_phase2 = max_phase2a + leader_phase2b;
+    double estimated_total = max_phase1 + total_phase2 + max_phase3 + max_phase4;
+
+    std::cout << "\nTiming Results:\n";
+    std::cout << "Phase 1 (Initial Partitioning and Sorting): " << max_phase1 << " seconds\n";
+    std::cout << "Phase 2 (Splitter Selection): " << total_phase2 << " seconds\n";
+    std::cout << "  - Sample Contribution: " << max_phase2a << " seconds\n";
+    std::cout << "  - Splitter Selection by Leader: " << leader_phase2b << " seconds\n";
+    std::cout << "Phase 3 (Partition and Exchange): " << max_phase3 << " seconds\n";
+    std::cout << "Phase 4 (Final Sorting): " << max_phase4 << " seconds\n";
+    std::cout << "Estimated Total Sorting Time (sum of phases): " << estimated_total << " seconds\n";
+    std::cout << "Measured Total Time: " << total_time << " seconds\n";
 
     // Cleanup synchronization primitives
     pthread_barrier_destroy(&global_config.barrier);
