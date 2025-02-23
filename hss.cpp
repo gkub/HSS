@@ -176,7 +176,7 @@ void* worker_function(void* arg) {
     return nullptr;
 }
 
-// Main execution flow with total timing
+// Main execution flow with total timing and initialization timers
 int main(int argc, char* argv[]) {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0] 
@@ -191,6 +191,8 @@ int main(int argc, char* argv[]) {
     global_config.total_elements = std::stoul(argv[4]);
     global_config.verbose_output = (argc >= 6 && std::string(argv[5]) == "--verbose");
 
+    // Time dataset generation
+    auto start_dataset_gen = Clock::now();
     // Generate skewed dataset without duplicates
     std::vector<long long> unique_sequence(global_config.total_elements);
     for (size_t i = 0; i < global_config.total_elements; ++i) {
@@ -202,11 +204,15 @@ int main(int argc, char* argv[]) {
     }
     std::mt19937 rng(global_config.random_seed);
     std::shuffle(global_config.dataset.begin(), global_config.dataset.end(), rng);
+    auto end_dataset_gen = Clock::now();
+    double dataset_gen_time = Duration(end_dataset_gen - start_dataset_gen).count();
 
     if (global_config.total_elements <= 100) {
         print_vector("Full dataset before sorting", global_config.dataset, true);
     }
 
+    // Time synchronization primitive initialization
+    auto start_sync_init = Clock::now();
     // Initialize synchronization primitives
     pthread_barrier_init(&global_config.barrier, nullptr, global_config.num_workers);
     pthread_mutex_init(&global_config.lock, nullptr);
@@ -215,9 +221,12 @@ int main(int argc, char* argv[]) {
     for (auto& lock : global_config.bucket_locks) {
         pthread_mutex_init(&lock, nullptr);
     }
+    auto end_sync_init = Clock::now();
+    double sync_init_time = Duration(end_sync_init - start_sync_init).count();
 
-    // Create worker threads and start total timing
+    // Time thread creation and algorithm execution
     auto total_start = Clock::now();
+    auto start_thread_creation = Clock::now();
     std::vector<pthread_t> threads(global_config.num_workers);
     std::vector<WorkerContext> contexts(global_config.num_workers);
     for (int i = 0; i < global_config.num_workers; ++i) {
@@ -229,6 +238,8 @@ int main(int argc, char* argv[]) {
         contexts[i].phase4_duration = 0.0;
         pthread_create(&threads[i], nullptr, worker_function, &contexts[i]);
     }
+    auto end_thread_creation = Clock::now();
+    double thread_creation_time = Duration(end_thread_creation - start_thread_creation).count();
 
     // Wait for all threads to complete
     for (auto& thread : threads) pthread_join(thread, nullptr);
@@ -266,7 +277,7 @@ int main(int argc, char* argv[]) {
         print_vector("Final sorted output", sorted_result, true);
     }
 
-    // Compute and display timing results
+    // Compute and display timing results for algorithm phases
     double max_phase1 = 0.0;
     double max_phase2a = 0.0;
     double leader_phase2b = 0.0;
@@ -286,7 +297,14 @@ int main(int argc, char* argv[]) {
     double total_phase2 = max_phase2a + leader_phase2b;
     double estimated_total = max_phase1 + total_phase2 + max_phase3 + max_phase4;
 
-    std::cout << "\nTiming Results:\n";
+    // Display initialization timing results
+    std::cout << "\nInitialization Timing:\n";
+    std::cout << "Dataset Generation: " << dataset_gen_time << " seconds\n";
+    std::cout << "Synchronization Primitive Initialization: " << sync_init_time << " seconds\n";
+    std::cout << "Thread Creation: " << thread_creation_time << " seconds\n";
+
+    // Display algorithm timing results
+    std::cout << "\nAlgorithm Timing Results:\n";
     std::cout << "Phase 1 (Initial Partitioning and Sorting): " << max_phase1 << " seconds\n";
     std::cout << "Phase 2 (Splitter Selection): " << total_phase2 << " seconds\n";
     std::cout << "  - Sample Contribution: " << max_phase2a << " seconds\n";
@@ -294,7 +312,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Phase 3 (Partition and Exchange): " << max_phase3 << " seconds\n";
     std::cout << "Phase 4 (Final Sorting): " << max_phase4 << " seconds\n";
     std::cout << "Estimated Total Sorting Time (sum of phases): " << estimated_total << " seconds\n";
-    std::cout << "Measured Total Time: " << total_time << " seconds\n";
+    std::cout << "Measured Total Time (including thread creation): " << total_time << " seconds\n";
 
     // Cleanup synchronization primitives
     pthread_barrier_destroy(&global_config.barrier);
